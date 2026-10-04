@@ -3,7 +3,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ProviderUsageResult } from "@get-bb/plugin-sdk/provider-bridge";
 
-const QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const DEFAULT_QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const FALLBACK_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 const REFRESH_URL = "https://oauth2.googleapis.com/token";
 const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 // Google requires a client secret to exchange a refresh token. Never embed one
@@ -64,8 +65,30 @@ export function normalizeAntigravityUsage(summary: QuotaSummary, email: string |
   return { supported: true, usage: { status: "ok", accountEmail: email, planLabel: "Antigravity", windows } };
 }
 
-async function requestQuota(accessToken: string, fetcher: typeof fetch): Promise<Response> {
-  return fetcher(QUOTA_URL, {
+async function requestQuota(
+  accessToken: string,
+  fetcher: typeof fetch,
+  quotaUrl?: string,
+): Promise<Response> {
+  const url = quotaUrl ?? process.env.ANTIGRAVITY_QUOTA_URL ?? DEFAULT_QUOTA_URL;
+  try {
+    const res = await fetcher(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+      },
+      body: JSON.stringify({ project: "aicode-consumers" }),
+    });
+    if (res.ok || res.status === 401 || res.status === 403 || url !== DEFAULT_QUOTA_URL) {
+      return res;
+    }
+  } catch (cause) {
+    if (url !== DEFAULT_QUOTA_URL) throw cause;
+  }
+
+  return fetcher(FALLBACK_QUOTA_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -134,6 +157,7 @@ export async function readAntigravityUsage(options: {
   tokenPath?: string;
   fetcher?: typeof fetch;
   agyCli?: string;
+  quotaUrl?: string;
 } = {}): Promise<ProviderUsageResult> {
   const tokenPath = options.tokenPath ?? join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
   const fetcher = options.fetcher ?? fetch;
@@ -174,7 +198,7 @@ export async function readAntigravityUsage(options: {
   }
 
   try {
-    let response = await requestQuota(accessToken, fetcher);
+    let response = await requestQuota(accessToken, fetcher, options.quotaUrl);
 
     if (response.status === 401) {
       // Token was rejected. Try CLIENT_SECRET refresh first (if available), then
@@ -192,7 +216,7 @@ export async function readAntigravityUsage(options: {
         } catch { /* ignore */ }
       }
       if (!refreshedToken) return { supported: true, usage: { status: "expired" } };
-      response = await requestQuota(refreshedToken, fetcher);
+      response = await requestQuota(refreshedToken, fetcher, options.quotaUrl);
     }
 
     if (response.status === 401 || response.status === 403) {
