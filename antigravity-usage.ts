@@ -8,11 +8,10 @@ const REFRESH_URL = "https://oauth2.googleapis.com/token";
 const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 // Google requires a client secret to exchange a refresh token. Never embed one
 // from the Antigravity client in a distributable plugin.
-const CLIENT_SECRET = process.env.ANTIGRAVITY_OAUTH_CLIENT_SECRET;
 const USER_AGENT = "Antigravity/1.2.11";
 
 interface StoredToken {
-  token?: { access_token?: string; refresh_token?: string };
+  token?: { access_token?: string; refresh_token?: string; expiry?: string };
   id_token?: string;
 }
 
@@ -78,13 +77,14 @@ async function requestQuota(accessToken: string, fetcher: typeof fetch): Promise
 }
 
 async function refreshedAccessToken(refreshToken: string, fetcher: typeof fetch): Promise<string | null> {
-  if (!CLIENT_SECRET) return null;
+  const clientSecret = process.env.ANTIGRAVITY_OAUTH_CLIENT_SECRET;
+  if (!clientSecret) return null;
   const response = await fetcher(REFRESH_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
+      client_secret: clientSecret,
       grant_type: "refresh_token",
       refresh_token: refreshToken,
     }),
@@ -94,31 +94,107 @@ async function refreshedAccessToken(refreshToken: string, fetcher: typeof fetch)
   return typeof body.access_token === "string" ? body.access_token : null;
 }
 
+/** Returns true if the stored token's expiry is in the past or within 60 s. */
+function isTokenExpired(stored: StoredToken): boolean {
+  const expiry = stored.token?.expiry;
+  if (!expiry) return false;
+  try {
+    // expiry format: "2026-10-03T21:16:36.740624162-04:00" — strip sub-second
+    // precision beyond what Date.parse handles, then parse.
+    const normalized = expiry.replace(/(\.\d{3})\d+/, "$1");
+    const expiryMs = Date.parse(normalized);
+    if (!Number.isFinite(expiryMs)) return false;
+    return expiryMs - Date.now() < 60_000; // treat as expired if < 60 s away
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Invoke `agy -p ""` with a short timeout so the Antigravity CLI can refresh
+ * its OAuth token transparently.  We intentionally ignore stdout/stderr — the
+ * side-effect we care about is the updated token file on disk.
+ */
+async function refreshViaAgyCli(agyCli?: string): Promise<void> {
+  if (!agyCli) return;
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    // `-p ""` runs a single empty print-mode turn, which causes the CLI to
+    // verify/refresh its credentials before doing anything else, then exits.
+    await execFileAsync(agyCli, ["-p", ""], { timeout: 10_000, encoding: "utf8" });
+  } catch {
+    // Ignore errors — we'll re-read the token file anyway and detect failure
+    // downstream via the HTTP response status.
+  }
+}
+
 export async function readAntigravityUsage(options: {
   tokenPath?: string;
   fetcher?: typeof fetch;
+  agyCli?: string;
 } = {}): Promise<ProviderUsageResult> {
   const tokenPath = options.tokenPath ?? join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
   const fetcher = options.fetcher ?? fetch;
-  let stored: StoredToken;
-  try {
-    stored = JSON.parse(await readFile(tokenPath, "utf8")) as StoredToken;
-  } catch (cause) {
-    const code = cause && typeof cause === "object" && "code" in cause ? cause.code : null;
-    return code === "ENOENT"
-      ? { supported: true, usage: { status: "unauthenticated" } }
-      : error("Could not read the Antigravity authentication token.");
+
+  async function readToken(): Promise<StoredToken | null> {
+    try {
+      return JSON.parse(await readFile(tokenPath, "utf8")) as StoredToken;
+    } catch (cause) {
+      const code = cause && typeof cause === "object" && "code" in cause ? cause.code : null;
+      if (code === "ENOENT") return null;
+      throw cause;
+    }
   }
 
-  const accessToken = stored.token?.access_token;
+  let stored: StoredToken | null;
+  try {
+    stored = await readToken();
+  } catch {
+    return error("Could not read the Antigravity authentication token.");
+  }
+
+  if (!stored) return { supported: true, usage: { status: "unauthenticated" } };
+
+  let accessToken = stored.token?.access_token;
   if (!accessToken) return { supported: true, usage: { status: "unauthenticated" } };
+
+  // Proactively refresh via the agy CLI if the token is expired or near expiry,
+  // before making the quota request.
+  if (isTokenExpired(stored)) {
+    await refreshViaAgyCli(options.agyCli);
+    try {
+      const refreshed = await readToken();
+      if (refreshed?.token?.access_token) {
+        stored = refreshed;
+        accessToken = refreshed.token.access_token;
+      }
+    } catch { /* ignore, proceed with existing token */ }
+  }
+
   try {
     let response = await requestQuota(accessToken, fetcher);
-    if (response.status === 401 && stored.token?.refresh_token) {
-      const refreshed = await refreshedAccessToken(stored.token.refresh_token, fetcher);
-      if (!refreshed) return { supported: true, usage: { status: "expired" } };
-      response = await requestQuota(refreshed, fetcher);
+
+    if (response.status === 401) {
+      // Token was rejected. Try CLIENT_SECRET refresh first (if available), then
+      // fall back to re-invoking the agy CLI.
+      let refreshedToken: string | null = null;
+      if (stored.token?.refresh_token) {
+        refreshedToken = await refreshedAccessToken(stored.token.refresh_token, fetcher);
+      }
+      if (!refreshedToken) {
+        // agy CLI refresh (no client secret needed)
+        await refreshViaAgyCli(options.agyCli);
+        try {
+          const reread = await readToken();
+          refreshedToken = reread?.token?.access_token ?? null;
+        } catch { /* ignore */ }
+      }
+      if (!refreshedToken) return { supported: true, usage: { status: "expired" } };
+      response = await requestQuota(refreshedToken, fetcher);
     }
+
     if (response.status === 401 || response.status === 403) {
       return { supported: true, usage: { status: "expired" } };
     }
